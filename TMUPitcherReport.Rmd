@@ -1,0 +1,973 @@
+---
+title: ""
+pagetitle: "TMU Pitcher Report"
+output:
+  html_document:
+params:
+  app_dir: "."
+  rds_file: "tmu_session_data.rds"
+  session_key: ""
+  pitcher: ""
+  team_name: "THO_MOR"
+  session_label: "Live ABs"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.align = 'center')
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+
+# ============================ ABOUT =================================
+# TMU live-AB / scrimmage version of YallsPitcherReport.Rmd. Same front
+# page and page-2 pitch log, rebuilt on the Offseason App's data:
+#
+#   - reads tmu_session_data.rds (the $liveab part), or the frame the app
+#     hands over from "Download Pitcher Report" — overrides applied
+#   - pitch types are the app's PitchGroup (hand tag / TrackMan fill /
+#     manual override), never re-derived here
+#   - PA results, AVG, K, BB etc. come from add_pa_outcomes() /
+#     summarise_pa() in tmu_session_data.R, which this file SOURCES, so the
+#     report and the app's Game Stats tab cannot disagree
+#   - "vs. Opponent" is gone (it's all TMU); the Notes-based Base Situation
+#     table is replaced by a vs LHH / vs RHH split
+#   - one card per PITCHER PER SESSION, oldest first
+#
+# Standalone knit: put this file in the Offseason App folder, leave
+# session_key blank, knit -> it lists the sessions; paste a SessionKey
+# (or "all") into the params and knit again. pitcher narrows it to one or
+# more arms: "Hanna, Brogan; Smith, Jake".
+#
+# Fixes carried over from the Y'alls version while converting it:
+#   - Strike% was missing plain "FoulBall"; uses the app's STRIKE_CALLS
+#   - Chase% counted untracked pitches as out-of-zone; now located only
+#   - fastball threshold group said "Fastball" but tags are "Four-Seam",
+#     so fastballs were being graded on the fallback thresholds
+#   - Whiff% / Chase% printed 0% with no swings; now a dash
+#   - Race-to-2K only caught 0-2 in two pitches; now 0-2 or 1-2 within
+#     the first three pitches, or the PA over in three
+# ====================================================================
+
+# ============================ KNOBS =================================
+SHOW_PITCH_LOG <- TRUE
+
+# Outings longer than this print as two side-by-side half-tables.
+LOG_SPLIT_MIN  <- 62
+
+# Height in points the log TABLE should fill (title + legend sit outside).
+LOG_TARGET_PT  <- 600
+
+LOG_COLS_FULL    <- c("#","Inn","Batter","S","Cnt","Pitch","Res","Velo","Spin",
+                      "iVB","HB","Ext","RelH","VAA","pX","pZ","EV","LA","Dist")
+LOG_COLS_COMPACT <- c("#","Inn","Batter","S","Cnt","Pitch","Res","Velo","Spin",
+                      "iVB","HB","EV","LA")
+
+# Front-page density scale by pitch-type count. PAGE_FIT multiplies all of
+# it: this card carries one more row than the Y'alls card (the game line
+# under the header), so it starts a notch smaller. Nudge it if a print
+# preview spills to a second page (down) or leaves a gap at the bottom (up).
+PAGE_FIT <- 0.95
+pt_scale_for <- function(n) {
+  base <- if (is.na(n) || n <= 4) 1.00 else if (n == 5) 0.94 else if (n == 6) 0.88 else 0.82
+  base * PAGE_FIT
+}
+
+# Zone plots in CATCHER'S VIEW, same as the app card (positive PlateLocSide
+# — a RHH's inside — draws on the LEFT).
+CATCHER_VIEW <- TRUE
+
+# Whiff / Z-Whiff / Chase highlight thresholds by pitch family.
+fastball_group <- c("Four-Seam", "Two-Seam", "Sinker")
+breaking_group <- c("Cutter", "Slider", "Curveball", "Sweeper")
+offspeed_group <- c("Changeup", "Splitter", "Knuckleball")
+
+get_threshold <- function(pitch_type, metric) {
+  if (pitch_type %in% fastball_group) {
+    switch(metric, `Whiff %` = 17, `Chase %` = 18, `Z-Whiff %` = 15, 65)
+  } else if (pitch_type %in% breaking_group) {
+    switch(metric, `Whiff %` = 27, `Chase %` = 26, `Z-Whiff %` = 17, 65)
+  } else if (pitch_type %in% offspeed_group) {
+    switch(metric, `Whiff %` = 29, `Chase %` = 24, `Z-Whiff %` = 18, 65)
+  } else {
+    switch(metric, `Whiff %` = 25, `Chase %` = 25, `Z-Whiff %` = 17, 65)
+  }
+}
+# ====================================================================
+
+# ---- the app's data layer -------------------------------------------
+app_dir <- normalizePath(params$app_dir, mustWork = FALSE)
+helpers <- file.path(app_dir, "tmu_session_data.R")
+if (!file.exists(helpers)) {
+  stop("tmu_session_data.R not found in app_dir (", app_dir, "). Keep this ",
+       ".Rmd in the Offseason App folder, or point app_dir at it.")
+}
+source(helpers, local = knitr::knit_global())
+
+flip_name <- function(x) {
+  vapply(strsplit(as.character(x), ",\\s*"), function(p) {
+    if (length(p) >= 2 && !is.na(p[2])) paste(p[2], p[1]) else p[1]
+  }, character(1))
+}
+disp_side <- function(ps) if (isTRUE(CATCHER_VIEW)) -ps else ps
+
+split_keys <- function(x) {
+  if (is.null(x) || !length(x)) return(character(0))
+  v <- trimws(unlist(strsplit(as.character(x), ",")))
+  v[nzchar(v)]
+}
+# "Last, First" contains a comma, so names are separated with ; or |
+split_names <- function(x) {
+  if (is.null(x) || !length(x) || !nzchar(x)) return(character(0))
+  v <- trimws(unlist(strsplit(as.character(x), "[;|]")))
+  v[nzchar(v)]
+}
+
+home_plate_segments <- data.frame(
+  x    = c(0.71, 0.71,  0,   -0.71, -0.71),
+  y    = c(0,    0.3,   0.5,  0.3,   0),
+  xend = c(0.71, 0,    -0.71,-0.71,  0.71),
+  yend = c(0.3,  0.5,   0.3,  0,     0)
+)
+
+# ---- read -----------------------------------------------------------
+rds_path <- params$rds_file
+if (!grepl("^([/~]|[A-Za-z]:)", rds_path)) rds_path <- file.path(app_dir, rds_path)
+if (!file.exists(rds_path)) {
+  stop("rds_file not found: ", rds_path,
+       " — run build_tmu_session_data.R in the Offseason App folder first.")
+}
+obj <- readRDS(rds_path)
+
+# A bare data frame is what the app hands over: already the selected sessions,
+# so there is no picker. The build RDS is a list with $liveab.
+from_app <- is.data.frame(obj)
+full_data <- if (from_app) obj else obj$liveab
+if (is.null(full_data) || !nrow(full_data)) {
+  stop("No live-AB rows in ", basename(rds_path),
+       if (!from_app && !is.null(obj$status$liveab))
+         paste0(" (", obj$status$liveab, ")") else "")
+}
+full_data <- as.data.frame(full_data, stringsAsFactors = FALSE)
+
+# Overrides: the app applies them before handing the frame over. A
+# standalone knit applies tag_overrides.csv from the app folder itself.
+if (!"IsOverride" %in% names(full_data)) {
+  full_data <- apply_tag_overrides(
+    full_data, read_tag_overrides(file.path(app_dir, TAG_OVERRIDE_FILE)))
+}
+
+# PA results on the WHOLE session frame, before any pitcher filter.
+if (!"PAKey" %in% names(full_data)) full_data <- add_pa_outcomes(full_data)
+if (!"Tracked" %in% names(full_data)) full_data$Tracked <- !is.na(full_data$RelSpeed)
+
+# Team filter — skipped with a message if it would empty the report.
+if (nzchar(params$team_name) &&
+    any(full_data$PitcherTeam == params$team_name, na.rm = TRUE)) {
+  full_data <- full_data[!is.na(full_data$PitcherTeam) &
+                           full_data$PitcherTeam == params$team_name, , drop = FALSE]
+} else if (nzchar(params$team_name)) {
+  message("team_name '", params$team_name, "' matched no rows — keeping all.")
+}
+
+full_data$PlotPitchType <- as.character(full_data$PitchGroup)
+
+sessions_index <- build_session_index(full_data) %>%
+  transmute(SessionKey, Date, Pitches, Arms)
+
+# ---- which sessions -------------------------------------------------
+keys <- split_keys(params$session_key)
+if (from_app || any(tolower(keys) == "all")) {
+  session_chosen <- TRUE
+} else if (length(keys)) {
+  full_data <- full_data[full_data$SessionKey %in% keys, , drop = FALSE]
+  session_chosen <- nrow(full_data) > 0
+} else {
+  session_chosen <- FALSE
+}
+
+# ---- which pitchers, one card per pitcher per session ---------------
+want <- split_names(params$pitcher)
+if (length(want)) full_data <- full_data[full_data$Pitcher %in% want, , drop = FALSE]
+
+units <- if (session_chosen && nrow(full_data)) {
+  full_data %>%
+    group_by(SessionKey, Pitcher) %>%
+    summarise(first_date  = {v <- Date[!is.na(Date)]
+                             if (length(v)) min(v) else NA_character_},
+              first_pitch = suppressWarnings(min(PitchNo, na.rm = TRUE)),
+              .groups = "drop") %>%
+    arrange(first_date, SessionKey, first_pitch, Pitcher) %>%
+    as.data.frame(stringsAsFactors = FALSE)
+} else data.frame()
+```
+
+```{r session_picker, echo=FALSE, results='asis'}
+if (!session_chosen) {
+  cat("## Pick a session\n\n")
+  cat("Set **`session_key`** in the params header to one of the SessionKeys",
+      "below (comma-separate several, or `all`), then re-knit.\n\n")
+  print(knitr::kable(sessions_index, format = "html", table.attr = "class='table'"))
+  knitr::knit_exit()
+}
+if (!nrow(units)) {
+  cat("## Nothing to report\n\n")
+  cat("The session / pitcher params matched no pitches.\n\n")
+  knitr::knit_exit()
+}
+```
+<style>
+* {
+  -webkit-print-color-adjust: exact !important;
+  print-color-adjust: exact !important;
+}
+
+body {
+  font-family: Arial, sans-serif;
+  font-size: 11pt;
+}
+h1 {
+  font-size: 20pt;
+  margin-bottom: 5px;
+  text-align: center;
+  margin-top: 0;
+}
+h2 {
+  font-size: 14pt;
+  margin-top: 5px;
+  margin-bottom: 5px;
+  border-bottom: 2px solid #333;
+}
+.header-info {
+  text-align: center;
+  font-size: 12pt;
+  margin-bottom: 5px;
+}
+table {
+  font-size: 10pt;
+}
+.pitcher-section {
+  page-break-after: always;
+}
+.pitcher-section:last-child {
+  page-break-after: avoid;
+}
+.game-line table { margin: 2px auto 4px auto !important; }
+.game-line th { background: #1a1a2e !important; color: #fff !important; }
+.game-line td { font-weight: bold; }
+.two-column-tables {
+  display: flex;
+  gap: 20px;
+  margin-top: 5px;
+}
+.two-column-tables > div {
+  flex: 1;
+  width: 50%;
+}
+.two-column-plots {
+  display: flex;
+  gap: 20px;
+  margin-top: 5px;
+  align-items: flex-start;
+}
+.two-column-plots > div {
+  flex: 1;
+  width: 50%;
+}
+.three-column-plots {
+  display: flex;
+  gap: 20px;
+  margin-top: 5px;
+  align-items: flex-start;
+}
+.three-column-plots > div {
+  flex: 1;
+  width: 33.33%;
+}
+.empty-note { text-align: center; color: #666; font-style: italic; margin: 6px 0; }
+/* per-pitcher density scale; overwritten inline as style="--pt: 0.80" */
+.pitcher-section { --pt: 1; }
+
+/* ---------------- page 2: pitch-by-pitch log ---------------- */
+/* pandoc merges the raw pitcher-section div with its own H1 section div, so
+   the log can end up NESTED inside .pitcher-section instead of a sibling.
+   break-before on the log itself fires either way — do not rely on the
+   parent's page-break-after. */
+.pitch-log-section { --lf: 7pt; --lp: 2pt;
+                     page-break-before: always; break-before: page; }
+.log-split { page-break-inside: avoid; break-inside: avoid; }
+.pitch-log-section h1 { font-size: 16pt; margin: 0 0 2px 0; text-align: center; }
+.pitch-log-section .log-sub { text-align: center; font-size: 10pt;
+                              color: #333; margin-bottom: 6px; }
+.pitch-log-section table { font-size: var(--lf) !important; width: 100% !important;
+                           margin: 0 auto !important; }
+.pitch-log-section table td { padding: var(--lp) 2px !important; line-height: 1.12 !important;
+                              white-space: nowrap !important; }
+.pitch-log-section table th { padding: calc(var(--lp) + 1pt) 2px !important;
+                              line-height: 1.12 !important;
+                              white-space: nowrap !important;
+                              font-size: var(--lf) !important; }
+.log-split { display: flex; gap: 12px; align-items: flex-start; }
+.log-split > div { flex: 1; width: 50%; }
+.log-legend { font-size: 8pt; color: #444; margin-top: 6px; text-align: center; }
+
+@media print {
+  @page { size: letter portrait; margin: 0.3in; }
+
+  html, body { margin: 0; padding: 0; font-size: 11pt; }
+
+  .pitcher-section { page-break-after: always; page-break-inside: auto; }
+  .pitcher-section:last-child { page-break-after: avoid; }
+
+  h1 { font-size: 20pt; margin: 0 0 6px 0; page-break-after: avoid; }
+  h2 { font-size: 12.5pt; margin: 4px 0 2px 0; page-break-after: avoid;
+       border-bottom: 2px solid #333; }
+  .header-info { font-size: 11pt; margin-bottom: 4px; }
+
+  table { font-size: 8.6pt !important; margin: 0 auto 4px auto; width: 100% !important; }
+  table td { padding: 3px 5px !important; line-height: 1.2 !important;
+              white-space: nowrap !important; }
+  table th { padding: 4px 4px !important; line-height: 1.15 !important;
+             white-space: normal !important; }
+  thead { display: table-header-group; }
+  tr, img { page-break-inside: avoid; }
+  .two-column-tables { page-break-inside: auto; }
+
+  .two-column-tables, .two-column-plots, .three-column-plots {
+    gap: 14px; margin-top: 5px;
+  }
+
+  .three-column-plots img { width: 100%; height: auto; max-height: 1.70in; }
+  .two-column-plots  img { width: 100%; height: auto; max-height: 2.40in; }
+  img { max-width: 100%; }
+
+  .pitcher-section table    { font-size: calc(8.6pt * var(--pt)) !important; }
+  .pitcher-section table td { padding: calc(3px * var(--pt)) calc(5px * var(--pt)) !important; }
+  .pitcher-section table th { padding: calc(4px * var(--pt)) calc(4px * var(--pt)) !important; }
+  .pitcher-section h1 { font-size: calc(20pt * var(--pt)); }
+  .pitcher-section h2 { font-size: calc(12.5pt * var(--pt)); }
+  .pitcher-section .header-info { font-size: calc(11pt * var(--pt)); }
+  .pitcher-section .three-column-plots img { max-height: calc(1.70in * var(--pt)); }
+  .pitcher-section .two-column-plots  img { max-height: calc(2.40in * var(--pt)); }
+  .pitcher-section .two-column-tables,
+  .pitcher-section .two-column-plots,
+  .pitcher-section .three-column-plots { gap: calc(14px * var(--pt));
+                                         margin-top: calc(5px * var(--pt)); }
+
+  .pitch-log-section { page-break-before: always; break-before: page;
+                       page-break-after: always; page-break-inside: auto; }
+  .log-split { page-break-inside: avoid; break-inside: avoid; }
+  .pitch-log-section:last-child { page-break-after: avoid; }
+  .pitch-log-section h1 { font-size: 15pt; page-break-after: avoid; }
+  .pitch-log-section table { font-size: var(--lf) !important; }
+  .pitch-log-section table td { padding: var(--lp) 2px !important; }
+  .pitch-log-section table th { padding: calc(var(--lp) + 1pt) 2px !important;
+                                font-size: var(--lf) !important; }
+  .log-split { gap: 10px; }
+}
+</style>
+```{r results='asis'}
+kbl_std <- function(x, font = 11, escape = TRUE) {
+  x %>%
+    kable(format = "html", align = "c", escape = escape) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = TRUE, font_size = font) %>%
+    row_spec(0, bold = TRUE, background = "#f0f0f0")
+}
+
+emit_pair <- function(t1, k1, t2, k2) {
+  cat('<div class="two-column-tables">\n<div>\n')
+  if (!is.null(k1)) { cat(paste0('<h2>', t1, '</h2>\n')); print(k1) }
+  cat('</div>\n<div>\n')
+  if (!is.null(k2)) { cat(paste0('<h2>', t2, '</h2>\n')); print(k2) }
+  cat('</div>\n</div>\n\n')
+}
+
+highlight_cell <- function(v, pitch_type, metric) {
+  thr <- vapply(pitch_type, get_threshold, numeric(1), metric = metric)
+  hot <- !is.na(v) & v >= thr
+  cell_spec(ifelse(is.na(v), "\u2014", paste0(v, "%")), "html",
+            bold = hot, color = ifelse(hot, "white", "black"),
+            background = ifelse(hot, "#D30000", "transparent"))
+}
+
+for (u in seq_len(nrow(units))) {
+  pitcher  <- units$Pitcher[u]
+  sess_key <- units$SessionKey[u]
+
+  data <- full_data %>%
+    filter(Pitcher == pitcher, SessionKey == sess_key) %>%
+    arrange(is.na(PitchNo), PitchNo)
+
+  pitcher_name <- flip_name(pitcher)
+  session_date <- pretty_session_date(units$first_date[u])
+  # A game against another school reads "vs NKU"; a scrimmage keeps the label.
+  opp <- if ("Opponent" %in% names(data)) data$Opponent[1] else NA_character_
+  unit_label <- if (is.na(opp) || !nzchar(opp)) params$session_label else
+    paste0("vs ", team_display(opp))
+
+  hand <- unique(data$PitcherThrows); hand <- hand[!is.na(hand)]
+  hand_lbl <- if (!length(hand)) "" else if (grepl("^L", hand[1])) "LHP" else "RHP"
+
+  # Plots and rate stats use tracked pitches; results use every pitch.
+  df_plot <- data %>% filter(Tracked, !is.na(RelSpeed))
+
+  n_pt <- df_plot %>%
+    filter(!is.na(PlotPitchType)) %>%
+    distinct(PlotPitchType) %>% nrow()
+  pt <- pt_scale_for(n_pt)
+
+  pa   <- pa_table(data)
+  line <- summarise_pa(pa)
+  disc <- summarise_pitches(data)
+  n_untr <- sum(!data$Tracked, na.rm = TRUE)
+
+  cat(sprintf('<div class="pitcher-section" style="--pt: %.2f">\n\n', pt))
+  cat(paste0("# ", pitcher_name, " | ", session_date, " | ",
+             unit_label, "\n\n"))
+  cat('<div class="header-info">',
+      paste(c(hand_lbl,
+              paste0(nrow(data), " Pitches",
+                     if (n_untr > 0) paste0(" (", n_untr, " untracked)") else ""),
+              paste0(line$PA, " BF"),
+              paste0(n_pt, " Pitch Types")),
+            collapse = " &nbsp;|&nbsp; "),
+      '</div>\n', sep = "")
+
+  # ================== GAME LINE ==================
+  game_line <- tibble(
+    BF = line$PA, AB = line$AB, H = line$H, `2B` = line$`2B`,
+    `3B` = line$`3B`, HR = line$HR, BB = line$BB, HBP = line$HBP,
+    K = line$K, AVG = fmt_avg(line$AVG), OBP = fmt_avg(line$OBP),
+    SLG = fmt_avg(line$SLG), `K%` = fmt_pct(line$`K%`, 1),
+    `BB%` = fmt_pct(line$`BB%`, 1))
+  cat('<div class="game-line">\n')
+  game_line %>%
+    kable(format = "html", align = "c") %>%
+    kable_styling(bootstrap_options = "condensed", full_width = TRUE, font_size = 11) %>%
+    print()
+  cat('</div>\n')
+  cat('<hr>\n\n')
+
+  if (nrow(df_plot) == 0) {
+    cat('<div class="empty-note">No tracked pitches in this outing \u2014 ',
+        'results above and the pitch log still count every charted pitch.</div>\n\n')
+  } else {
+
+  # ================== VELO DENSITY ==================
+  mean_velo <- df_plot %>%
+    group_by(PlotPitchType) %>%
+    summarise(mean_speed = round(mean(RelSpeed, na.rm = TRUE), 1), .groups = "drop") %>%
+    arrange(desc(mean_speed))
+
+  df_plot$PlotPitchType   <- factor(df_plot$PlotPitchType, levels = mean_velo$PlotPitchType)
+  mean_velo$PlotPitchType <- factor(mean_velo$PlotPitchType, levels = mean_velo$PlotPitchType)
+
+  min_max_velo <- df_plot %>%
+    group_by(PlotPitchType) %>%
+    summarise(min_speed = round(min(RelSpeed, na.rm = TRUE), 1),
+              max_speed = round(max(RelSpeed, na.rm = TRUE), 1), .groups = "drop")
+
+  velo_density_plot <- ggplot(df_plot,
+      aes(x = RelSpeed, color = PlotPitchType, fill = PlotPitchType)) +
+    geom_density(alpha = 1, fill = NA, show.legend = FALSE, trim = TRUE) +
+    geom_density(alpha = 0.4, color = NA, show.legend = FALSE, trim = TRUE) +
+    facet_wrap(~PlotPitchType, ncol = if (n_pt >= 5) 2 else 1, dir = "v",
+               scales = "free_y", strip.position = "left") +
+    scale_color_manual(values = pitch_colors) +
+    scale_fill_manual(values = pitch_colors) +
+    geom_text(data = mean_velo,
+              aes(x = mean_speed, y = 0, label = sprintf("%.1f", mean_speed)),
+              vjust = -0.5, color = "black", size = if (n_pt >= 5) 2.6 else 3) +
+    geom_vline(data = min_max_velo, aes(xintercept = min_speed),
+               color = "black", linetype = "dashed") +
+    geom_vline(data = min_max_velo, aes(xintercept = max_speed),
+               color = "black", linetype = "dashed") +
+    theme(
+      axis.ticks.y = element_blank(),
+      axis.line.y  = element_blank(),
+      axis.text.y  = element_blank(),
+      strip.text.y.left = element_text(angle = 0, size = if (n_pt >= 5) 10 else 14),
+      panel.grid.major.x = element_line(color = "gray", linewidth = 0.1),
+      panel.grid.minor.y = element_blank(),
+      panel.background = element_rect(fill = "white"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 1)
+    ) +
+    labs(title = "Velo Density", x = "Velocity", y = NULL) +
+    theme(plot.title = element_text(size = 14, face = "bold"))
+
+  # ================== USAGE LHH vs RHH ==================
+  freq_data <- df_plot %>%
+    filter(!is.na(BatterSide), !is.na(PlotPitchType)) %>%
+    mutate(Side = case_when(
+      trimws(BatterSide) %in% c("Left", "L", "left")   ~ "LHH",
+      trimws(BatterSide) %in% c("Right", "R", "right") ~ "RHH",
+      TRUE ~ NA_character_)) %>%
+    filter(!is.na(Side)) %>%
+    group_by(Side, PlotPitchType) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(Side) %>%
+    mutate(freq = n / sum(n)) %>%
+    ungroup() %>%
+    mutate(freq_plot   = ifelse(Side == "LHH", -freq, freq),
+           label       = paste0(round(freq * 100, 0), "%"),
+           label_hjust = ifelse(Side == "LHH", 1.05, -0.05))
+
+  if (nrow(freq_data) == 0) {
+    usage_plot <- ggplot() + theme_void() +
+      labs(title = "No Pitch Usage Data") +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  } else {
+    usage_plot <- ggplot(freq_data,
+                         aes(y = PlotPitchType, x = freq_plot, fill = PlotPitchType)) +
+      geom_col(width = 0.6) +
+      geom_vline(xintercept = 0, color = "black", linewidth = 1) +
+      geom_text(aes(label = label, hjust = label_hjust),
+                size = if (n_pt >= 5) 4.4 else 6, fontface = "bold", color = "black") +
+      scale_x_continuous(labels = function(x) paste0(abs(x * 100), "%"),
+                         limits = c(-0.9, 0.9)) +
+      scale_fill_manual(values = pitch_colors, guide = "none") +
+      labs(title = "Pitch Usage", subtitle = "LHH vs RHH", x = NULL, y = NULL) +
+      theme_minimal(base_size = 13) +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+            plot.subtitle = element_text(hjust = 0.5),
+            panel.grid.major.y = element_blank(),
+            panel.grid.minor = element_blank(),
+            axis.text.y = element_blank(),
+            legend.position = "none")
+  }
+
+  # ================== MOVEMENT ==================
+  df_movement <- df_plot %>% filter(!is.na(HorzBreak), !is.na(InducedVertBreak))
+
+  movement_plot <- ggplot(df_movement,
+      aes(x = HorzBreak, y = InducedVertBreak, color = PlotPitchType)) +
+    geom_point(size = 2.5, alpha = 0.7) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    scale_color_manual(values = pitch_colors) +
+    scale_x_continuous(limits = c(-24, 24), breaks = seq(-24, 24, 6)) +
+    scale_y_continuous(limits = c(-24, 24), breaks = seq(-24, 24, 6)) +
+    labs(title = "Pitch Movement Plot",
+         x = "Horizontal Break (inches)",
+         y = "Induced Vertical Break (inches)",
+         color = "Pitch Type") +
+    coord_fixed() +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 14),
+          legend.position = "bottom")
+
+  cat('<div class="three-column-plots">\n')
+  cat('<div>\n\n'); print(velo_density_plot); cat('\n\n</div>\n')
+  cat('<div>\n\n'); print(usage_plot);        cat('\n\n</div>\n')
+  cat('<div>\n\n'); print(movement_plot);     cat('\n\n</div>\n')
+  cat('</div>\n\n')
+
+  # ================== VELO BY INNING (or by batter) ==================
+  # Live ABs are often one long "inning". With fewer than two innings
+  # charted, the x axis becomes the batter faced instead, so the plot
+  # still shows whether velo held up.
+  n_inn <- dplyr::n_distinct(df_plot$Inning[!is.na(df_plot$Inning)])
+  if (n_inn >= 2) {
+    velo_x <- df_plot %>% mutate(X = Inning)
+    x_lab  <- "Inning"; v_title <- "Avg Velocity by Inning"
+  } else {
+    bf_order <- unique(data$PAKey)
+    velo_x <- df_plot %>% mutate(X = match(PAKey, bf_order))
+    x_lab  <- "Batter Faced"; v_title <- "Avg Velocity by Batter Faced"
+  }
+  velo_inning_data <- velo_x %>%
+    filter(!is.na(X)) %>%
+    group_by(X, PlotPitchType) %>%
+    summarise(avg_velo = round(mean(RelSpeed, na.rm = TRUE), 1), .groups = "drop")
+
+  velo_inning_plot <- ggplot(velo_inning_data,
+      aes(x = X, y = avg_velo, color = PlotPitchType, group = PlotPitchType)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    geom_text(aes(label = avg_velo), vjust = -0.8, size = 3, fontface = "bold",
+              show.legend = FALSE) +
+    scale_color_manual(values = pitch_colors) +
+    scale_x_continuous(breaks = sort(unique(velo_inning_data$X))) +
+    labs(title = v_title, x = x_lab, y = "Avg Velocity (mph)", color = "Pitch Type") +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 14),
+          legend.position = "bottom",
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(fill = "white"),
+          panel.border = element_rect(color = "black", fill = NA, linewidth = 1))
+
+  # ================== ZONE BY PITCH TYPE ==================
+  zone_df <- df_plot %>%
+    filter(!is.na(PlateLocSide), !is.na(PlateLocHeight)) %>%
+    mutate(PX = disp_side(PlateLocSide))
+  pitch_counts  <- zone_df %>% count(PlotPitchType, name = "n_pitches")
+  heatmap_types <- pitch_counts %>% filter(n_pitches >= 100) %>% pull(PlotPitchType)
+  point_types   <- pitch_counts %>% filter(n_pitches <  100) %>% pull(PlotPitchType)
+
+  zone_plot <- ggplot() +
+    geom_rect(data = data.frame(xmin = SZ_XMIN, xmax = SZ_XMAX,
+                                ymin = SZ_YMIN, ymax = SZ_YMAX),
+              aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+              inherit.aes = FALSE, fill = NA, color = "black", linewidth = 1.2) +
+    geom_segment(data = home_plate_segments,
+                 aes(x = x, y = y, xend = xend, yend = yend),
+                 color = "black", linewidth = 1, inherit.aes = FALSE) +
+    stat_density_2d(
+      data = zone_df %>% filter(PlotPitchType %in% heatmap_types),
+      aes(x = PX, y = PlateLocHeight, fill = after_stat(level)),
+      geom = "polygon", alpha = 0.45, contour = TRUE, show.legend = FALSE) +
+    scale_fill_gradient(low = "#ffe5e5", high = "#cc0000") +
+    geom_point(
+      data = zone_df %>% filter(PlotPitchType %in% point_types),
+      aes(x = PX, y = PlateLocHeight, color = PlotPitchType),
+      alpha = 0.8, size = 2) +
+    facet_wrap(~PlotPitchType, ncol = if (n_pt <= 4) 2 else 3) +
+    scale_color_manual(values = pitch_colors, guide = "none") +
+    scale_y_continuous(limits = c(0, 5.5)) +
+    scale_x_continuous(limits = c(-2.5, 2.5)) +
+    labs(title = "Strike Zone Plot by Pitch Type",
+         subtitle = if (isTRUE(CATCHER_VIEW)) "Catcher's view" else "Pitcher's view",
+         x = NULL, y = NULL) +
+    coord_fixed() +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 14),
+          plot.subtitle = element_text(size = 9, color = "gray40"),
+          legend.position = "none",
+          strip.text = element_text(face = "bold", size = if (n_pt >= 5) 9 else 11),
+          panel.grid.major = element_line(color = "gray90"),
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(fill = "white"),
+          panel.border = element_rect(color = "black", fill = NA, linewidth = 1))
+
+  cat('<div class="two-column-plots">\n')
+  cat('<div>\n\n'); print(velo_inning_plot); cat('\n\n</div>\n')
+  cat('<div>\n\n'); print(zone_plot);        cat('\n\n</div>\n')
+  cat('</div>\n\n')
+  }  # end tracked-pitch plots
+
+  # ================== PITCH SUMMARY ==================
+  # Flags come from add_session_flags() — the same definitions the app uses.
+  # AVG is by the pitch the PA ENDED on.
+  flagged <- add_session_flags(df_plot) %>%
+    mutate(IsZWhiff    = HasLoc & InZone & IsWhiff,
+           IsZoneSwing = HasLoc & InZone & IsSwing,
+           IsOZ        = HasLoc & !InZone,
+           PA_AB  = !is.na(PAEnd) & PAEnd & PAResult %in% AB_RESULTS,
+           PA_H   = !is.na(PAEnd) & PAEnd & PAResult %in% HIT_RESULTS,
+           PA_K   = !is.na(PAEnd) & PAEnd & PAResult == "K",
+           PA_BB  = !is.na(PAEnd) & PAEnd & PAResult == "BB")
+
+  summary_table <- flagged %>%
+    group_by(PlotPitchType) %>%
+    summarise(
+      `#`        = n(),
+      `Avg Velo` = round(mean(RelSpeed, na.rm = TRUE), 1),
+      `Max Velo` = round(max(RelSpeed, na.rm = TRUE), 1),
+      `Spin`     = round(mean(SpinRate, na.rm = TRUE), 0),
+      `iVB`      = round(mean(InducedVertBreak, na.rm = TRUE), 1),
+      `HB`       = round(mean(HorzBreak, na.rm = TRUE), 1),
+      # fmt_num() dashes a missing mean — Yakkertech has no extension, and
+      # paste0() on NaN printed "NaNft".
+      `RelH`     = paste0(fmt_num(mean(RelHeight, na.rm = TRUE), 1), "ft"),
+      `Ext`      = paste0(fmt_num(mean(Extension, na.rm = TRUE), 1), "ft"),
+      `VAA`      = paste0(fmt_num(mean(VertApprAngle, na.rm = TRUE), 1), "\u00B0"),
+      `Zone %`   = ifelse(sum(HasLoc) == 0, "\u2014",
+                          paste0(round(100 * sum(InZone) / sum(HasLoc), 1), "%")),
+      `Strike %` = paste0(round(100 * mean(IsStrike, na.rm = TRUE), 1), "%"),
+      `Whiff %`  = ifelse(sum(IsSwing) == 0, NA_real_,
+                          round(100 * sum(IsWhiff) / sum(IsSwing), 1)),
+      `Z-Whiff %`= ifelse(sum(IsZoneSwing) == 0, NA_real_,
+                          round(100 * sum(IsZWhiff) / sum(IsZoneSwing), 1)),
+      `Chase %`  = ifelse(sum(IsOZ) == 0, NA_real_,
+                          round(100 * sum(IsChase) / sum(IsOZ), 1)),
+      `AVG`      = fmt_avg(.rate(sum(PA_H), sum(PA_AB))),
+      `K/BB`     = paste0(sum(PA_K), "/", sum(PA_BB)),
+      .groups = "drop") %>%
+    rename(`Pitch Type` = PlotPitchType) %>%
+    mutate(`Pitch Type` = as.character(`Pitch Type`),
+           across(c(RelH, Ext, VAA), ~ sub("^\u2014.*$", "\u2014", .x)))
+
+  if (nrow(summary_table)) {
+    summary_table <- summary_table %>%
+      mutate(`Whiff %`   = highlight_cell(`Whiff %`,   `Pitch Type`, "Whiff %"),
+             `Z-Whiff %` = highlight_cell(`Z-Whiff %`, `Pitch Type`, "Z-Whiff %"),
+             `Chase %`   = highlight_cell(`Chase %`,   `Pitch Type`, "Chase %"))
+
+    cat('\n\n## Pitch Summary\n\n')
+    summary_table %>%
+      kable(format = "html", align = "c", escape = FALSE) %>%
+      kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                    full_width = TRUE, font_size = 11) %>%
+      row_spec(0, bold = TRUE, background = "#f0f0f0") %>%
+      print()
+    cat('\n\n')
+  }
+
+  # ================== BATTED BALL SUMMARY ==================
+  bip <- flagged %>% filter(IsBIP)
+  bb_kbl <- if (nrow(bip) == 0) NULL else {
+    bip %>%
+      mutate(BBT = batted_ball_type(Angle)) %>%
+      group_by(PlotPitchType) %>%
+      summarise(
+        `BIP`    = n(),
+        `H`      = sum(PAResult %in% HIT_RESULTS & PAEnd, na.rm = TRUE),
+        `Avg EV` = fmt_num(mean(ExitSpeed, na.rm = TRUE), 1),
+        `GB %`   = fmt_pct(.rate(sum(BBT == "GB", na.rm = TRUE), sum(!is.na(BBT))), 0),
+        `LD %`   = fmt_pct(.rate(sum(BBT == "LD", na.rm = TRUE), sum(!is.na(BBT))), 0),
+        `FB %`   = fmt_pct(.rate(sum(BBT == "FB", na.rm = TRUE), sum(!is.na(BBT))), 0),
+        `Hard Hit %` = fmt_pct(.rate(sum(ExitSpeed >= HARD_HIT_MPH, na.rm = TRUE),
+                                     sum(!is.na(ExitSpeed))), 0),
+        .groups = "drop") %>%
+      rename(`Pitch Type` = PlotPitchType) %>%
+      kbl_std()
+  }
+  if (is.null(bb_kbl)) {
+    bb_kbl <- tibble(Note = "No balls in play") %>% kbl_std()
+  }
+
+  # ================== PLATOON SPLITS ==================
+  # Replaces the Y'alls Base Situation table: TMU live ABs don't carry the
+  # hand-typed base state in Notes, but every PA has a batter side.
+  side_of <- function(x) case_when(
+    trimws(x) %in% c("Left", "L", "left")   ~ "vs LHH",
+    trimws(x) %in% c("Right", "R", "right") ~ "vs RHH",
+    TRUE ~ NA_character_)
+  plat_rows <- lapply(c("vs LHH", "vs RHH"), function(sd) {
+    p_sd <- if (is.null(pa)) NULL else pa[side_of(pa$BatterSide) %in% sd, , drop = FALSE]
+    d_sd <- data[side_of(data$BatterSide) %in% sd, , drop = FALSE]
+    if (!nrow(d_sd)) return(NULL)
+    s1 <- summarise_pa(p_sd); s2 <- summarise_pitches(d_sd)
+    tibble(Split = sd, P = nrow(d_sd), PA = s1$PA, AVG = fmt_avg(s1$AVG),
+           OBP = fmt_avg(s1$OBP), K = s1$K, BB = s1$BB,
+           `Strike %` = fmt_pct(s2$`Strike%`), `Whiff %` = fmt_pct(s2$`Whiff%`),
+           `Chase %` = fmt_pct(s2$`Chase%`))
+  })
+  plat_tbl <- bind_rows(plat_rows)
+  plat_kbl <- if (nrow(plat_tbl)) kbl_std(plat_tbl, font = 9) else NULL
+
+  # ================== USAGE BY COUNT ==================
+  usage_kbl <- NULL
+  usage_cnt <- df_plot %>%
+    filter(!is.na(Balls), !is.na(Strikes)) %>%
+    mutate(Count = case_when(
+      Balls == 0 & Strikes == 0 ~ "0-0",
+      Strikes == 2              ~ "2K",
+      Strikes > Balls           ~ "Ahead",
+      Balls > Strikes           ~ "Behind",
+      TRUE                      ~ "Even"),
+      Count = factor(Count, levels = c("0-0", "Ahead", "Even", "Behind", "2K")))
+  if (nrow(usage_cnt)) {
+    usage_kbl <- usage_cnt %>%
+      mutate(PlotPitchType = as.character(PlotPitchType)) %>%
+      group_by(Count, PlotPitchType) %>%
+      summarise(n = n(), .groups = "drop_last") %>%
+      mutate(pct = paste0(round(100 * n / sum(n), 0), "%")) %>%
+      ungroup() %>% select(-n) %>%
+      tidyr::pivot_wider(names_from = PlotPitchType, values_from = pct,
+                         values_fill = "\u2014") %>%
+      arrange(Count) %>%
+      kbl_std(font = 9)
+  }
+
+  # ================== OVERALL METRICS ==================
+  # PA-level: FPS%, Race-to-2K, Putaway% are over HIS completed PAs.
+  pa_pitches <- data %>% filter(!is.na(PAKey)) %>% group_by(PAKey) %>%
+    summarise(Reached2K = any(!is.na(Strikes) & Strikes == 2),
+              EarlyTwo  = any(!is.na(Strikes) & Strikes == 2 &
+                                !is.na(Balls) & Balls <= 1 & PitchInPA <= 4),
+              .groups = "drop")
+  pa_x <- if (is.null(pa)) NULL else left_join(pa, pa_pitches, by = "PAKey")
+
+  r2k_pct <- if (is.null(pa_x) || !nrow(pa_x)) NA_real_ else
+    mean(pa_x$EarlyTwo | (pa_x$Pitches <= 3 & !pa_x$PAResult %in% c("BB", "HBP")))
+  putaway_pct <- if (is.null(pa_x) || !any(pa_x$Reached2K)) NA_real_ else
+    mean(pa_x$PAResult[pa_x$Reached2K] %in% OUT_RESULTS)
+
+  # Whole percents and the 9pt table font: nine columns share half a page,
+  # and "100.0%" at 11pt ran BB% off the right edge.
+  overall_metrics <- tibble(
+    `FPS%`     = fmt_pct(disc$`FPS%`),
+    `R2K%`     = fmt_pct(r2k_pct),
+    `Putaway%` = fmt_pct(putaway_pct),
+    `Whiff%`   = fmt_pct(disc$`Whiff%`),
+    `Chase%`   = fmt_pct(disc$`Chase%`),
+    `CSW%`     = fmt_pct(disc$`CSW%`),
+    `Soft%`    = fmt_pct(disc$`Soft%`),
+    `K%`       = fmt_pct(line$`K%`),
+    `BB%`      = fmt_pct(line$`BB%`))
+  om_kbl <- kbl_std(overall_metrics, font = 9)
+
+  emit_pair('Batted Ball Summary', bb_kbl,    'Platoon Splits',  plat_kbl)
+  emit_pair('Usage by Count',      usage_kbl, 'Overall Metrics', om_kbl)
+
+  cat('</div>\n\n')
+
+  # ==================================================================
+  # PAGE 2 — PITCH-BY-PITCH LOG ("back of the sheet")
+  # ------------------------------------------------------------------
+  # Built from `data`, NOT df_plot, so untracked pitches still appear in
+  # the sequence and the count matches the real outing. The PA-ending
+  # pitch shows the PA RESULT from add_pa_outcomes() — so a K inferred from
+  # the count prints as K, not CS.
+  # ==================================================================
+  if (SHOW_PITCH_LOG && nrow(data) > 0) {
+
+    log_pitch_colors <- pitch_colors
+    log_pitch_colors[c("Cutter","Changeup","Sweeper","Knuckleball")] <-
+      c("#B7950B","#1E8449","#0E7490","#4D7A2E")
+
+    fmt1 <- function(x) ifelse(is.na(.num(x)), "\u2014", sprintf("%.1f", .num(x)))
+    fmt0 <- function(x) ifelse(is.na(.num(x)), "\u2014", sprintf("%.0f", .num(x)))
+    short_name <- function(x) {
+      out <- vapply(strsplit(as.character(x), ",\\s*"), function(p) {
+        if (length(p) >= 2 && !is.na(p[2])) paste0(p[1], ", ", substr(p[2], 1, 1))
+        else if (length(p) >= 1) p[1] else NA_character_
+      }, character(1))
+      ifelse(is.na(out), "\u2014", out)
+    }
+
+    log_raw <- data %>%
+      mutate(
+        .inn = .num(Inning),
+        .pc  = ifelse(is.na(PitchCall), "", as.character(PitchCall)),
+        .ppt = as.character(PlotPitchType),
+        .newpa = PAKey != dplyr::lag(PAKey, default = ""),
+        .pitch_res = case_when(
+          .pc == "HitByPitch"                         ~ "HBP",
+          .pc %in% BALL_CALLS                         ~ "B",
+          .pc == "StrikeCalled"                       ~ "CS",
+          .pc == "StrikeSwinging"                     ~ "SW",
+          grepl("^Foul", .pc)                         ~ "F",
+          .pc == "InPlay"                             ~ "IP",
+          TRUE                                        ~ "\u2014"),
+        .res = case_when(
+          !is.na(PAEnd) & PAEnd & PAResult %in% c("SF", "SH") ~ "SAC",
+          !is.na(PAEnd) & PAEnd & PAResult == "BIP"           ~ "IP",
+          !is.na(PAEnd) & PAEnd & PAResult != "Incomplete"    ~ PAResult,
+          TRUE                                                ~ .pitch_res),
+        .res_col = case_when(
+          .res %in% c("B","BB","HBP")          ~ "#C0392B",
+          .res %in% c("CS","K","SW")           ~ "#1E8449",
+          .res == "F"                          ~ "#B9770E",
+          .res %in% c("1B","2B","3B","HR")     ~ "#7D3C98",
+          TRUE                                 ~ "#21618C"),
+        .res_bold = .res %in% c("K","BB","HBP","SW","HR","3B","2B","1B"),
+        .bat = short_name(Batter),
+        .batshort = substr(sub(",.*$", "", ifelse(is.na(Batter), "\u2014",
+                                                  as.character(Batter))), 1, 10),
+        .side = ifelse(is.na(BatterSide), "", substr(as.character(BatterSide), 1, 1))
+      )
+
+    log_disp <- log_raw %>%
+      transmute(
+        `#`    = dplyr::row_number(),
+        Inn    = ifelse(is.na(.inn), "\u2014", as.character(.inn)),
+        Batter = ifelse(.newpa, .bat, ""),
+        S      = ifelse(.newpa, .side, ""),
+        Cnt    = ifelse(is.na(.num(Balls)) | is.na(.num(Strikes)), "\u2014",
+                        paste0(as.integer(.num(Balls)), "-", as.integer(.num(Strikes)))),
+        Pitch  = cell_spec(
+                   ifelse(!is.na(.ppt) & .ppt %in% names(pitch_abbr),
+                          unname(pitch_abbr[.ppt]),
+                          ifelse(is.na(.ppt), "\u2014", substr(.ppt, 1, 2))),
+                   "html", bold = TRUE,
+                   color = ifelse(!is.na(.ppt) & .ppt %in% names(log_pitch_colors),
+                                  unname(log_pitch_colors[.ppt]), "#333333")),
+        Res    = cell_spec(.res, "html", bold = .res_bold, color = .res_col),
+        Velo   = fmt1(RelSpeed),
+        Spin   = fmt0(SpinRate),
+        iVB    = fmt1(InducedVertBreak),
+        HB     = fmt1(HorzBreak),
+        Ext    = fmt1(Extension),
+        RelH   = fmt1(RelHeight),
+        VAA    = fmt1(VertApprAngle),
+        pX     = fmt1(PlateLocSide),
+        pZ     = fmt1(PlateLocHeight),
+        EV     = ifelse(.pc == "InPlay", fmt1(ExitSpeed), "\u2014"),
+        LA     = ifelse(.pc == "InPlay", fmt0(Angle),     "\u2014"),
+        Dist   = ifelse(.pc == "InPlay", fmt0(Distance),  "\u2014"),
+        .inn      = .inn,
+        .newpa    = .newpa,
+        .bat      = .bat,
+        .batshort = .batshort,
+        .side     = .side
+      )
+
+    render_log_tbl <- function(d, cols) {
+      iv    <- ifelse(is.na(d$.inn), -1, d$.inn)
+      grp   <- cumsum(c(TRUE, diff(iv) != 0))
+      shade <- which(grp %% 2 == 0)
+      brdr  <- which(d$.newpa) - 1
+      brdr  <- brdr[brdr >= 1]
+      both  <- intersect(shade, brdr)
+      s_o   <- setdiff(shade, brdr)
+      b_o   <- setdiff(brdr, shade)
+      bcss  <- "border-bottom: 1px solid #aab2ba;"
+
+      k <- d[, cols, drop = FALSE] %>%
+        kable(format = "html", align = "c", escape = FALSE) %>%
+        kable_styling(bootstrap_options = c("condensed"), full_width = TRUE) %>%
+        row_spec(0, bold = TRUE, background = "#e6e9ec")
+      if (length(s_o))  k <- row_spec(k, s_o,  background = "#eef2f6")
+      if (length(b_o))  k <- row_spec(k, b_o,  extra_css = bcss)
+      if (length(both)) k <- row_spec(k, both, background = "#eef2f6", extra_css = bcss)
+      k
+    }
+
+    n_log     <- nrow(log_disp)
+    split_log <- n_log > LOG_SPLIT_MIN
+    cols_use  <- if (split_log) LOG_COLS_COMPACT else LOG_COLS_FULL
+    rows_side <- if (split_log) ceiling(n_log / 2) else n_log
+    lf <- if (!split_log) {
+            if (rows_side <= 30) 9.6 else if (rows_side <= 45) 8.8 else 7.8
+          } else if (rows_side <= 55) 7.2
+            else if (rows_side <= 70) 6.8
+            else 6.2
+    text_pt <- rows_side * lf * 1.12
+    lp <- round(min(3.8, max(0.4, (LOG_TARGET_PT - text_pt) / (rows_side + 1) / 2)), 2)
+
+    if (split_log) {
+      log_disp$Batter <- ifelse(log_disp$.newpa, log_disp$.batshort, "")
+    }
+
+    n_strikes <- sum(log_raw$.pc %in% STRIKE_CALLS, na.rm = TRUE)
+
+    cat(sprintf('<div class="pitch-log-section" style="--lf: %.1fpt; --lp: %.2fpt">\n\n',
+                lf, lp))
+    cat(paste0('<h1>', pitcher_name, ' &mdash; Pitch by Pitch</h1>\n'))
+    cat(paste0('<div class="log-sub">', session_date, ' &nbsp;|&nbsp; ',
+               unit_label, ' &nbsp;|&nbsp; ', n_log, ' P &nbsp;|&nbsp; ',
+               line$PA, ' BF &nbsp;|&nbsp; ',
+               line$H, ' H &nbsp;|&nbsp; ', line$K, ' K &nbsp;|&nbsp; ',
+               line$BB, ' BB &nbsp;|&nbsp; ',
+               round(100 * n_strikes / n_log, 0), '% strikes</div>\n'))
+
+    if (split_log) {
+      half <- ceiling(n_log / 2)
+      d1 <- log_disp[1:half, , drop = FALSE]
+      d2 <- log_disp[(half + 1):n_log, , drop = FALSE]
+      if (identical(d2$Batter[1], "")) {
+        d2$Batter[1] <- d2$.batshort[1]
+        d2$S[1]      <- d2$.side[1]
+      }
+      cat('<div class="log-split">\n<div>\n\n')
+      print(render_log_tbl(d1, cols_use))
+      cat('\n\n</div>\n<div>\n\n')
+      print(render_log_tbl(d2, cols_use))
+      cat('\n\n</div>\n</div>\n\n')
+    } else {
+      print(render_log_tbl(log_disp, cols_use))
+    }
+
+    cat(paste0('<div class="log-legend">',
+               'B = ball &middot; CS = called strike &middot; SW = swinging strike &middot; ',
+               'F = foul &middot; K / BB / HBP = PA ended &middot; ',
+               '1B / 2B / 3B / HR / Out / FC / E / SAC / IP = ball in play ',
+               '(IP = no result charted) &middot; Cnt = count before the pitch',
+               '</div>\n'))
+    cat('</div>\n\n')
+  }
+}
+```

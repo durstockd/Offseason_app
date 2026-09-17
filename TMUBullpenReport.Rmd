@@ -1,0 +1,950 @@
+---
+title: ""
+pagetitle: "TMU Bullpen Report"
+output:
+  html_document:
+params:
+  bullpen_dir: "/Users/drewdurstock/game_files/Reports/bullpens"
+  csv_file: "latest"
+  data_file: ""
+  session_key: ""
+  pitcher: ""
+  team_name: "THO_MOR"
+  session_label: "Bullpen"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align = 'center', fig.width = 7, fig.height = 5)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(knitr)
+library(kableExtra)
+
+# ======================== KNOBS =====================================
+# Offseason bullpen version of the Y'alls pitcher report.
+#
+# TWO WAYS IN:
+#   1. Standalone knit (data_file = ""): reads a raw TrackMan bullpen CSV
+#      from bullpen_dir — csv_file = "latest" or a file name, as before.
+#   2. From the Offseason App ("Download Bullpen Report"): the app writes
+#      the frame it is showing — overrides applied — to an .rds and passes
+#      it as data_file. data_file may also be tmu_session_data.rds itself
+#      (the $bullpen part is used). session_key narrows it to one or more
+#      sessions (comma-separated; "" or "all" = every session in the file),
+#      pitcher to one or more arms ("Last, First", comma-separated).
+#
+# One card (+ its page-2 log) per PITCHER PER SESSION, oldest first, so a
+# report covering several pens never blends two days into one card.
+#
+# Loads dplyr/ggplot2/readr rather than tidyverse so the app can render it
+# on shinyapps.io without deploying the whole tidyverse.
+#
+# CUT vs. the in-season report, because a bullpen has no hitters swinging:
+#   pitch usage LHH/RHH, velo by inning, batted ball summary, usage by
+#   count, base situation, and every Whiff/Z-Whiff/Chase/K-BB column.
+# KEPT: velo density, movement, zone by pitch type, pitch summary,
+#   overall metrics, and a page-2 pitch-by-pitch log.
+
+# Page-2 pitch-by-pitch log ("back of the sheet"). One extra page per
+# pitcher, so a duplex print puts the log on the back of his card.
+SHOW_PITCH_LOG <- TRUE
+
+# Sessions longer than this print as two side-by-side half-tables. A
+# bullpen is usually 20-45 pitches, so the default keeps it full-width
+# with the bigger font and the wider metric set.
+LOG_SPLIT_MIN  <- 62
+
+# Height in points the log table should fill. Font is capped by COLUMN
+# WIDTH, not height, so row padding is stretched to fill what's left.
+# This is the TABLE only — the title block (~40pt) and legend (~20pt) sit
+# outside it, and .log-split is break-inside:avoid, so overshooting here
+# pushes the whole table to the next page and strands the title alone.
+LOG_TARGET_PT  <- 600
+
+# "instead of hitters, the number of each pitch": the PT# column is the
+# nth pitch of THAT type in the session. TRUE also prints the session
+# total for that type, e.g. "3/12".
+PT_NUM_SHOW_TOTAL <- TRUE
+
+# Only these pitchers, if non-empty. Names as they appear in the CSV
+# ("Last, First"), e.g. c("Hanna, Brogan").
+PITCHER_FILTER <- character(0)
+
+# Restrict to this team code. Set to "" to keep every row in the file.
+# If the code matches nothing the filter is skipped with a message
+# rather than silently emptying the report.
+TEAM_FILTER <- params$team_name
+
+# TrackMan rounds its own Tilt column to the nearest quarter hour; the
+# averaged tilt is rounded the same way so the card matches the export.
+# Verified against the Tilt column on the 8/14 bullpen: all 45 pitches
+# agree once rounded.
+TILT_ROUND_MIN <- 15
+
+# Rule-book zone, same fixed box as every other TMU app (no batter-height
+# adjustment).
+SZ_XMIN <- -0.83; SZ_XMAX <- 0.83
+SZ_YMIN <-  1.50; SZ_YMAX <- 3.50
+
+# Zone plot in CATCHER'S VIEW, same as the app card and TMUPitcherReport
+# (positive PlateLocSide — a RHH's inside — draws on the LEFT). FALSE puts
+# it back to the raw pitcher's-view plot.
+CATCHER_VIEW <- TRUE
+
+# h2 underline / accent. Set to TMU's exact hex to brand it.
+ACCENT_COLOR <- "#333333"
+
+# Label used when the CSV has no Pitcher value on a row.
+UNKNOWN_PITCHER <- "Unknown Pitcher"
+
+LOG_COLS_FULL    <- c("#","PT#","Pitch","Res","Velo","Spin","Tilt","iVB","HB",
+                      "Ext","RelH","RelS","VAA","HAA","pX","pZ")
+LOG_COLS_COMPACT <- c("#","PT#","Pitch","Res","Velo","Spin","iVB","HB","pX","pZ")
+
+# Front-page density scale by pitch-type count.
+pt_scale_for <- function(n) {
+  if (is.na(n) || n <= 4) 1.00 else if (n == 5) 0.94 else if (n == 6) 0.88 else 0.82
+}
+
+pitch_abbr <- c(
+  "Four-Seam" = "FF", "Fastball" = "FF", "FourSeamFastBall" = "FF",
+  "Two-Seam"  = "FT", "TwoSeamFastBall" = "FT",
+  "Sinker"    = "SI", "Cutter" = "FC", "Slider" = "SL", "Sweeper" = "ST",
+  "Curveball" = "CU", "Changeup" = "CH", "ChangeUp" = "CH",
+  "Splitter"  = "FS", "Knuckleball" = "KN", "Unknown" = "--"
+)
+# ====================================================================
+
+# Pitch-name standardizer (copied verbatim from pitch_tagging_engine.R so
+# TaggedPitchType lines up with the apps' vocabulary, e.g. "ChangeUp" and
+# "Changeup" both become "Changeup"). Pure function — does NOT run the tagger.
+std_pitch_name <- function(x) {
+  x <- trimws(as.character(x))
+  dplyr::case_when(
+    x %in% c("FourSeamFastBall","FourSeam","Four-Seam","FourSeamFastball",
+             "Fastball","FA","FF","4-Seam","4Seam")          ~ "Four-Seam",
+    x %in% c("TwoSeamFastBall","TwoSeam","Two-Seam",
+             "FT","2-Seam","2Seam")                           ~ "Two-Seam",
+    x %in% c("Sinker","SI","Sink")                            ~ "Sinker",
+    x %in% c("Cutter","Cut","CT","FC")                        ~ "Cutter",
+    x %in% c("Slider","SL","Slide")                           ~ "Slider",
+    x %in% c("Curveball","CurveBall","Curve","CU","CB",
+             "KnuckleCurve","Knuckle-Curve")                  ~ "Curveball",
+    x %in% c("ChangeUp","Changeup","Change","Change-Up",
+             "CH","CHS","Change-up")                          ~ "Changeup",
+    x %in% c("Splitter","Split","Split-Finger",
+             "SplitFinger","FS")                              ~ "Splitter",
+    x %in% c("Sweeper","Sweep")                               ~ "Sweeper",
+    x %in% c("Knuckleball","KnuckleBall","Knuckle")           ~ "Knuckleball",
+    x %in% c("Screwball","Eephus","Other","Unknown",
+             "Undefined","")                                  ~ "Unknown",
+    is.na(x)                                                  ~ "Unknown",
+    TRUE                                                      ~ stringr::str_to_title(x)
+  )
+}
+
+pitch_colors <- c(
+  "Fastball" = "#FF0000",
+  "FourSeamFastBall" = "#FF0000",
+  "Four-Seam" = "#FF0000",
+  "TwoSeamFastBall" = "#E67E22",
+  "Two-Seam" = "#E67E22",
+  "Sinker" = "#E67E22",
+  "Changeup" = "#2ECC71",
+  "ChangeUp" = "#2ECC71",
+  "Slider" = "#3498DB",
+  "Curveball" = "#9B59B6",
+  "Sweeper" = "#14A3C7",
+  "Cutter" = "#F1C40F",
+  "Splitter" = "#1ABC9C",
+  "Knuckleball" = "#73B761",
+  "Unknown" = "#7F8C8D"
+)
+
+# Home plate segments
+home_plate_segments <- data.frame(
+  x    = c(0.71, 0.71,  0,   -0.71, -0.71),
+  y    = c(0,    0.3,   0.5,  0.3,   0),
+  xend = c(0.71, 0,    -0.71,-0.71,  0.71),
+  yend = c(0.3,  0.5,   0.3,  0,     0)
+)
+
+.num <- function(x) suppressWarnings(as.numeric(x))
+
+# --- tilt --------------------------------------------------------------
+# SpinAxis (degrees) -> clock tilt. Verified against TrackMan's own Tilt
+# column on the 8/14 TMU bullpen: this formula matches all 45 pitches once
+# rounded to the nearest quarter hour, which is what TrackMan reports.
+tilt_from_axis <- function(axis, round_min = TILT_ROUND_MIN) {
+  a  <- .num(axis)
+  h  <- ((a + 180) %% 360) / 30          # hours on a 12-hour face
+  mn <- h * 60
+  if (!is.null(round_min) && round_min > 0) mn <- round(mn / round_min) * round_min
+  mn <- mn %% 720
+  hh <- floor(mn / 60); mm <- round(mn - hh * 60)
+  hh[!is.na(hh) & hh == 0] <- 12
+  ifelse(is.na(a), NA_character_, sprintf("%d:%02d", hh, mm))
+}
+
+# circular mean of an angle vector, in degrees
+mean_axis <- function(a) {
+  a <- .num(a); a <- a[!is.na(a)]
+  if (!length(a)) return(NA_real_)
+  r <- a * pi / 180
+  (atan2(mean(sin(r)), mean(cos(r))) * 180 / pi) %% 360
+}
+
+# --- dates / times -----------------------------------------------------
+# Never call as.Date() straight on a column whose class has not been checked
+# — as.Date.default() errors on anything that isn't character/numeric/
+# factor/POSIXt. This returns NA instead of dying.
+parse_date <- function(x) {
+  if (inherits(x, "Date"))    return(x)
+  if (inherits(x, "POSIXt"))  return(as.Date(x))
+  if (is.factor(x)) x <- as.character(x)
+  x <- as.character(x)
+  for (f in c("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y/%m/%d")) {
+    d <- suppressWarnings(as.Date(x, format = f))
+    if (any(!is.na(d))) return(d)
+  }
+  as.Date(rep(NA_character_, length(x)))
+}
+
+pretty_date <- function(x) {
+  d <- parse_date(x)
+  if (all(is.na(d))) return(as.character(x)[1])
+  format(d[!is.na(d)][1], "%b %d, %Y")
+}
+
+# "08:06:05.04" -> "8:06 AM"
+pretty_time <- function(x) {
+  x <- as.character(x)
+  hh <- suppressWarnings(as.integer(substr(x, 1, 2)))
+  mm <- substr(x, 4, 5)
+  if (is.na(hh)) return(NA_character_)
+  ap <- if (hh >= 12) "PM" else "AM"
+  h12 <- hh %% 12; if (h12 == 0) h12 <- 12
+  sprintf("%d:%s %s", h12, mm, ap)
+}
+
+# --- resolve which CSV to read -----------------------------------------
+# csv_file is resolved against bullpen_dir:
+#   "latest"                -> newest *.csv in the folder by modified time
+#   "Bullpen-Aug_14_2026.csv" -> that file inside the folder
+#   "/some/other/path.csv"  -> used as-is (an absolute path wins)
+# If the named file isn't there, the folder's contents are listed in the
+# error rather than just "not found".
+resolve_bullpen_csv <- function(dir, f) {
+  if (!dir.exists(dir))
+    stop("bullpen_dir not found: ", dir)
+
+  pool <- list.files(dir, pattern = "\\.csv$", ignore.case = TRUE, full.names = TRUE)
+
+  if (is.null(f) || !nzchar(f) || tolower(f) %in% c("latest", "newest")) {
+    if (!length(pool)) stop("No .csv files in ", dir)
+    p <- pool[order(file.mtime(pool), decreasing = TRUE)][1]
+    message("csv_file = 'latest' -> ", basename(p))
+    return(p)
+  }
+
+  # absolute path, or one the caller already qualified
+  if (grepl("^([/~]|[A-Za-z]:)", f) || file.exists(f)) return(normalizePath(f, mustWork = TRUE))
+
+  p <- file.path(dir, f)
+  if (file.exists(p)) return(p)
+
+  stop("'", f, "' not found in ", dir,
+       if (length(pool)) paste0("\nFiles there: ",
+                                paste(basename(pool), collapse = ", "))
+       else "\n(folder has no .csv files)")
+}
+
+# --- split a comma-separated param into a clean vector -----------------
+split_param <- function(x) {
+  if (is.null(x) || !length(x)) return(character(0))
+  v <- trimws(unlist(strsplit(as.character(x), ",")))
+  v[nzchar(v)]
+}
+# "Last, First" names contain a comma, so pitcher uses ";" or "|" between
+# names instead — "Hanna, Brogan; Smith, Jake".
+split_names <- function(x) {
+  if (is.null(x) || !length(x) || !nzchar(x)) return(character(0))
+  v <- trimws(unlist(strsplit(as.character(x), "[;|]")))
+  v[nzchar(v)]
+}
+
+use_app_data <- nzchar(params$data_file)
+
+if (use_app_data) {
+  # --- read the frame the app handed over ------------------------------
+  if (!file.exists(params$data_file)) stop("data_file not found: ", params$data_file)
+  obj <- readRDS(params$data_file)
+  if (is.list(obj) && !is.data.frame(obj)) obj <- obj$bullpen
+  if (is.null(obj) || !nrow(obj)) stop("No bullpen rows in ", params$data_file)
+  raw <- as.data.frame(obj, stringsAsFactors = FALSE)
+
+  keys <- split_param(params$session_key)
+  keys <- keys[tolower(keys) != "all"]
+  if (length(keys)) raw <- raw[raw$SessionKey %in% keys, , drop = FALSE]
+  if (!nrow(raw)) stop("session_key matched no sessions in ", params$data_file)
+
+  src_label <- basename(params$data_file)
+} else {
+  csv_path <- resolve_bullpen_csv(params$bullpen_dir, params$csv_file)
+
+  # --- read the bullpen CSV --------------------------------------------
+  # Everything is read as character and coerced explicitly. TrackMan bullpen
+  # exports leave whole blocks of columns empty (no batted balls, no fielder
+  # positions), and letting readr guess types on those produces surprises.
+  raw <- readr::read_csv(csv_path,
+                         col_types = readr::cols(.default = readr::col_character()),
+                         na = c("", "NA", "NULL", "Undefined"),
+                         progress = FALSE) %>%
+    as.data.frame(stringsAsFactors = FALSE)
+  src_label <- basename(csv_path)
+}
+
+# Columns the report reads. Anything absent is created as NA so a partial
+# export degrades to em dashes instead of erroring inside a ggplot.
+# (Guard added deliberately: the fielder-positioning companion file that
+# TrackMan drops next to the real export has NONE of these.)
+NEEDED <- c("PitchNo","Date","Time","Pitcher","PitcherThrows","PitcherTeam",
+            "TaggedPitchType","AutoPitchType","PitchCall",
+            "RelSpeed","SpinRate","SpinAxis","Tilt","InducedVertBreak","HorzBreak",
+            "RelHeight","RelSide","Extension","VertApprAngle","HorzApprAngle",
+            "PlateLocSide","PlateLocHeight")
+missing_cols <- setdiff(NEEDED, names(raw))
+if (length(missing_cols)) {
+  message("Columns missing from ", src_label, " (filled with NA): ",
+          paste(missing_cols, collapse = ", "))
+  for (cc in missing_cols) raw[[cc]] <- NA_character_
+}
+
+# Hard stop if this isn't a pitch file at all — better than 40 empty plots.
+if (all(is.na(raw$RelSpeed)) && all(is.na(raw$PlateLocHeight))) {
+  stop("No pitch metrics in ", src_label,
+       " — RelSpeed and PlateLocHeight are entirely empty. This looks like the ",
+       "fielder-positioning companion file, not the TrackMan pitch export.")
+}
+
+NUM_COLS <- c("PitchNo","RelSpeed","SpinRate","SpinAxis","InducedVertBreak",
+              "HorzBreak","RelHeight","RelSide","Extension","VertApprAngle",
+              "HorzApprAngle","PlateLocSide","PlateLocHeight")
+for (cc in NUM_COLS) raw[[cc]] <- .num(raw[[cc]])
+
+# Team filter — skipped with a message if it would empty the file.
+if (nzchar(TEAM_FILTER)) {
+  if (any(raw$PitcherTeam == TEAM_FILTER, na.rm = TRUE)) {
+    raw <- raw %>% filter(PitcherTeam == TEAM_FILTER)
+  } else {
+    message("TEAM_FILTER '", TEAM_FILTER, "' matched no rows — keeping all ",
+            nrow(raw), " pitches. Codes present: ",
+            paste(unique(raw$PitcherTeam), collapse = ", "))
+  }
+}
+
+# Pitch type.
+#   App data: PitchGroup is exactly what the app shows — the hand tag, TrackMan's
+#   auto tag where one was left blank, and any manual override on top. It is
+#   used as-is so the report can never disagree with the card.
+#   CSV: trust the HAND tag. On this data AutoPitchType disagrees with the
+#   operator on a third of the pitches (it read 5 tagged Sinkers as
+#   Changeups), so Auto is only a fallback for rows the operator left blank.
+if (use_app_data && "PitchGroup" %in% names(raw)) {
+  raw$PlotPitchType <- ifelse(is.na(raw$PitchGroup) |
+                                raw$PitchGroup %in% c("", "Untagged"),
+                              "Unknown", as.character(raw$PitchGroup))
+} else {
+  raw <- raw %>%
+    mutate(
+      .tag  = std_pitch_name(TaggedPitchType),
+      .auto = std_pitch_name(AutoPitchType),
+      PlotPitchType = case_when(.tag  != "Unknown" ~ .tag,
+                                .auto != "Unknown" ~ .auto,
+                                TRUE               ~ "Unknown")
+    ) %>%
+    select(-.tag, -.auto)
+}
+raw$Pitcher <- ifelse(is.na(raw$Pitcher) | trimws(raw$Pitcher) == "",
+                      UNKNOWN_PITCHER, trimws(raw$Pitcher))
+
+# Session key — the app frame already has one; a raw CSV gets GameID, or
+# the file name when GameID is blank.
+if (!"SessionKey" %in% names(raw)) {
+  gid <- if ("GameID" %in% names(raw)) raw$GameID else NA_character_
+  raw$SessionKey <- ifelse(is.na(gid) | gid == "", src_label, gid)
+}
+
+# Derive Tilt from SpinAxis only where the export didn't supply it.
+if ("Tilt" %in% names(raw)) {
+  raw$Tilt <- ifelse(is.na(raw$Tilt) | trimws(as.character(raw$Tilt)) == "",
+                     tilt_from_axis(raw$SpinAxis), as.character(raw$Tilt))
+}
+
+pitchers <- unique(raw$Pitcher)
+pitchers <- pitchers[!is.na(pitchers)]
+PITCHER_FILTER <- unique(c(PITCHER_FILTER, split_names(params$pitcher)))
+if (length(PITCHER_FILTER)) pitchers <- intersect(pitchers, PITCHER_FILTER)
+
+# One card per pitcher per session, oldest session first.
+# NOTE: never name a mutate() output ".d" — it partially matches mutate()'s
+# own `.data` argument and dies with "object 'Date' not found" (same family
+# as the .after / .before gotcha).
+units <- raw %>%
+  filter(Pitcher %in% pitchers) %>%
+  mutate(date_chr = as.character(parse_date(Date))) %>%
+  group_by(SessionKey, Pitcher) %>%
+  summarise(first_date  = {v <- date_chr[!is.na(date_chr)]
+                           if (length(v)) min(v) else NA_character_},
+            first_pitch = suppressWarnings(min(PitchNo, na.rm = TRUE)),
+            .groups = "drop") %>%
+  arrange(first_date, SessionKey, first_pitch, Pitcher) %>%
+  as.data.frame(stringsAsFactors = FALSE)
+```
+
+```{r no_data, echo=FALSE, results='asis'}
+if (nrow(units) == 0) {
+  cat("## No pitchers in this file\n\n")
+  cat("`", src_label, "` parsed but no pitcher rows survived the ",
+      "filters. Check `PITCHER_FILTER` / the pitcher param and `TEAM_FILTER` ",
+      "in the setup chunk.\n\n", sep = "")
+  knitr::knit_exit()
+}
+```
+<style>
+* {
+  -webkit-print-color-adjust: exact !important;
+  print-color-adjust: exact !important;
+}
+
+body {
+  font-family: Arial, sans-serif;
+  font-size: 11pt;
+}
+h1 {
+  font-size: 20pt;
+  margin-bottom: 5px;
+  text-align: center;
+  margin-top: 0;
+}
+h2 {
+  font-size: 14pt;
+  margin-top: 5px;
+  margin-bottom: 5px;
+  border-bottom: 2px solid #333333;
+}
+.header-info {
+  text-align: center;
+  font-size: 12pt;
+  margin-bottom: 5px;
+}
+table {
+  font-size: 10pt;
+}
+.pitcher-section {
+  page-break-after: always;
+}
+.pitcher-section:last-child {
+  page-break-after: avoid;
+}
+.two-column-plots {
+  display: flex;
+  gap: 20px;
+  margin-top: 5px;
+  align-items: flex-start;
+}
+.two-column-plots > div {
+  flex: 1;
+  width: 50%;
+}
+.full-plot { margin-top: 5px; }
+.full-plot img { width: 100%; height: auto; }
+
+/* per-pitcher density scale; overwritten inline as style="--pt: 0.88" */
+.pitcher-section { --pt: 1; }
+
+/* ---------------- page 2: pitch-by-pitch log ---------------- */
+/* pandoc merges the raw pitcher-section div with its own H1 section div, so
+   the log can end up NESTED inside .pitcher-section instead of a sibling.
+   break-before on the log itself fires either way — do not rely on the
+   parent's page-break-after. */
+.pitch-log-section { --lf: 7pt; --lp: 2pt;
+                     page-break-before: always; break-before: page; }
+.log-split { page-break-inside: avoid; break-inside: avoid; }
+.pitch-log-section h1 { font-size: 16pt; margin: 0 0 2px 0; text-align: center; }
+.pitch-log-section .log-sub { text-align: center; font-size: 10pt;
+                              color: #333; margin-bottom: 6px; }
+.pitch-log-section table { font-size: var(--lf) !important; width: 100% !important;
+                           margin: 0 auto !important; }
+.pitch-log-section table td { padding: var(--lp) 2px !important; line-height: 1.12 !important;
+                              white-space: nowrap !important; }
+.pitch-log-section table th { padding: calc(var(--lp) + 1pt) 2px !important;
+                              line-height: 1.12 !important;
+                              white-space: nowrap !important;
+                              font-size: var(--lf) !important; }
+.log-split { display: flex; gap: 12px; align-items: flex-start; }
+.log-split > div { flex: 1; width: 50%; }
+.log-legend { font-size: 8pt; color: #444; margin-top: 6px; text-align: center; }
+
+@media print {
+  @page { size: letter portrait; margin: 0.3in; }
+
+  html, body { margin: 0; padding: 0; font-size: 11pt; }
+
+  /* one pitcher per page: break AFTER the section only. No fixed height,
+     no page-break-inside:avoid (a full-page block can't honor it). */
+  .pitcher-section { page-break-after: always; page-break-inside: auto; }
+  .pitcher-section:last-child { page-break-after: avoid; }
+
+  h1 { font-size: 20pt; margin: 0 0 6px 0; page-break-after: avoid; }
+  h2 { font-size: 12.5pt; margin: 4px 0 2px 0; page-break-after: avoid;
+       border-bottom: 2px solid #333333; }
+  .header-info { font-size: 11pt; margin-bottom: 4px; }
+
+  table { font-size: 8.6pt !important; margin: 0 auto 4px auto; width: 100% !important; }
+  table td { padding: 3px 5px !important; line-height: 1.2 !important;
+              white-space: nowrap !important; }
+  table th { padding: 4px 4px !important; line-height: 1.15 !important;
+             white-space: normal !important; }
+  thead { display: table-header-group; }
+  tr, img { page-break-inside: avoid; }
+
+  .two-column-plots { gap: 14px; margin-top: 5px; }
+
+  /* cap plot heights — this is what keeps a pitcher on one page.
+     Only three plots here instead of five, so they get more room than
+     the in-season card gives them. */
+  .two-column-plots img { width: 100%; height: auto; max-height: 3.10in; }
+  .full-plot img { width: 100%; height: auto; max-height: 3.60in; }
+  img { max-width: 100%; }
+
+  /* ---- density scaling: the whole front page shrinks together as the
+     pitch-type count climbs. --pt is set inline per pitcher. ---- */
+  .pitcher-section table    { font-size: calc(8.6pt * var(--pt)) !important; }
+  .pitcher-section table td { padding: calc(3px * var(--pt)) calc(5px * var(--pt)) !important; }
+  .pitcher-section table th { padding: calc(4px * var(--pt)) calc(4px * var(--pt)) !important; }
+  .pitcher-section h1 { font-size: calc(20pt * var(--pt)); }
+  .pitcher-section h2 { font-size: calc(12.5pt * var(--pt)); }
+  .pitcher-section .header-info { font-size: calc(11pt * var(--pt)); }
+  .pitcher-section .two-column-plots img { max-height: calc(3.10in * var(--pt)); }
+  .pitcher-section .full-plot img { max-height: calc(3.60in * var(--pt)); }
+  .pitcher-section .two-column-plots { gap: calc(14px * var(--pt));
+                                       margin-top: calc(5px * var(--pt)); }
+
+  /* ---- page 2 log ---- */
+  .pitch-log-section { page-break-before: always; break-before: page;
+                       page-break-after: always; page-break-inside: auto; }
+  .log-split { page-break-inside: avoid; break-inside: avoid; }
+  .pitch-log-section:last-child { page-break-after: avoid; }
+  .pitch-log-section h1 { font-size: 15pt; page-break-after: avoid; }
+  .pitch-log-section table { font-size: var(--lf) !important; }
+  .pitch-log-section table td { padding: var(--lp) 2px !important; }
+  .pitch-log-section table th { padding: calc(var(--lp) + 1pt) 2px !important;
+                                font-size: var(--lf) !important; }
+  .log-split { gap: 10px; }
+}
+</style>
+```{r results='asis'}
+for (u in seq_len(nrow(units))) {
+  pitcher  <- units$Pitcher[u]
+  sess_key <- units$SessionKey[u]
+
+  # --- this arm's session, renumbered 1..n -----------------------------
+  # PitchNo in the export is session-global across every arm in the pen
+  # (the 8/14 file runs 1-19 for the first guy, 20-45 for the second), so
+  # it gets renumbered per pitcher. PT# is the nth pitch of THAT type.
+  pdat <- raw %>%
+    filter(Pitcher == pitcher, SessionKey == sess_key) %>%
+    arrange(is.na(PitchNo), PitchNo) %>%
+    mutate(SeqNo = row_number()) %>%
+    group_by(PlotPitchType) %>%
+    mutate(PTNum = row_number(), PTTot = n()) %>%
+    ungroup()
+
+  pitcher_name <- sapply(strsplit(pitcher, ", "), function(x) {
+    if (length(x) >= 2) paste(x[2], x[1]) else x[1]
+  })
+
+  hand <- unique(pdat$PitcherThrows)
+  hand <- hand[!is.na(hand)][1]
+  hand_lbl <- if (is.na(hand)) "" else if (grepl("^L", hand)) "LHP" else "RHP"
+
+  session_date <- pretty_date(pdat$Date)
+
+  t_start <- pretty_time(pdat$Time[1])
+  t_end   <- pretty_time(pdat$Time[nrow(pdat)])
+
+  # tracked pitches only for the plots and rate stats
+  df_plot <- pdat %>% filter(!is.na(RelSpeed))
+
+  n_pt <- df_plot %>%
+    filter(!is.na(PlotPitchType)) %>%
+    distinct(PlotPitchType) %>% nrow()
+  pt <- pt_scale_for(n_pt)
+
+  cat(sprintf('<div class="pitcher-section" style="--pt: %.2f">\n\n', pt))
+  cat(paste0("# ", pitcher_name, " | ", session_date, " | ",
+             params$session_label, "\n\n"))
+  cat('<div class="header-info">',
+      paste(c(hand_lbl,
+              paste0(nrow(pdat), " Pitches"),
+              paste0(n_pt, " Pitch Types"),
+              if (!is.na(t_start) && !is.na(t_end)) paste0(t_start, " \u2013 ", t_end)),
+            collapse = " &nbsp;|&nbsp; "),
+      '</div>\n', sep = "")
+  cat('<hr>\n\n')
+
+  # ================== VELO DENSITY ==================
+  mean_velo <- df_plot %>%
+    group_by(PlotPitchType) %>%
+    summarise(mean_speed = round(mean(RelSpeed, na.rm = TRUE), 1), .groups = "drop") %>%
+    arrange(desc(mean_speed))
+
+  df_plot$PlotPitchType   <- factor(df_plot$PlotPitchType, levels = mean_velo$PlotPitchType)
+  mean_velo$PlotPitchType <- factor(mean_velo$PlotPitchType, levels = mean_velo$PlotPitchType)
+
+  min_max_velo <- df_plot %>%
+    group_by(PlotPitchType) %>%
+    summarise(min_speed = round(min(RelSpeed, na.rm = TRUE), 1),
+              max_speed = round(max(RelSpeed, na.rm = TRUE), 1), .groups = "drop")
+
+  velo_density_plot <- ggplot(df_plot,
+      aes(x = RelSpeed, color = PlotPitchType, fill = PlotPitchType)) +
+    geom_density(alpha = 1, fill = NA, show.legend = FALSE, trim = TRUE) +
+    geom_density(alpha = 0.4, color = NA, show.legend = FALSE, trim = TRUE) +
+    facet_wrap(~PlotPitchType, ncol = if (n_pt >= 5) 2 else 1, dir = "v",
+               scales = "free_y", strip.position = "left") +
+    scale_color_manual(values = pitch_colors) +
+    scale_fill_manual(values = pitch_colors) +
+    geom_text(data = mean_velo,
+              aes(x = mean_speed, y = 0, label = sprintf("%.1f", mean_speed)),
+              vjust = -0.5, color = "black", size = if (n_pt >= 5) 2.6 else 3) +
+    geom_vline(data = min_max_velo, aes(xintercept = min_speed),
+               color = "black", linetype = "dashed") +
+    geom_vline(data = min_max_velo, aes(xintercept = max_speed),
+               color = "black", linetype = "dashed") +
+    theme(
+      axis.ticks.y = element_blank(),
+      axis.line.y  = element_blank(),
+      axis.text.y  = element_blank(),
+      strip.text.y.left = element_text(angle = 0, size = if (n_pt >= 5) 10 else 13),
+      panel.grid.major.x = element_line(color = "gray", linewidth = 0.1),
+      panel.grid.minor.y = element_blank(),
+      panel.background = element_rect(fill = "white"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 1)
+    ) +
+    labs(title = "Velo Distribution", x = "Velocity", y = NULL) +
+    theme(plot.title = element_text(size = 14, face = "bold"))
+
+  # ================== MOVEMENT ==================
+  df_movement <- df_plot %>%
+    filter(!is.na(HorzBreak), !is.na(InducedVertBreak))
+
+  movement_plot <- ggplot(df_movement,
+      aes(x = HorzBreak, y = InducedVertBreak, color = PlotPitchType)) +
+    geom_point(size = 2.5, alpha = 0.7) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    scale_color_manual(values = pitch_colors) +
+    scale_x_continuous(limits = c(-24, 24), breaks = seq(-24, 24, 6)) +
+    scale_y_continuous(limits = c(-24, 24), breaks = seq(-24, 24, 6)) +
+    labs(title = "Pitch Movement Plot",
+         x = "Horizontal Break (inches)",
+         y = "Induced Vertical Break (inches)",
+         color = "Pitch Type") +
+    coord_fixed() +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 14),
+          legend.position = "bottom")
+
+  cat('<div class="two-column-plots">\n')
+  cat('<div>\n\n'); print(velo_density_plot); cat('\n\n</div>\n')
+  cat('<div>\n\n'); print(movement_plot);      cat('\n\n</div>\n')
+  cat('</div>\n\n')
+
+  # ================== STRIKE ZONE BY PITCH TYPE ==================
+  zone_df <- df_plot %>%
+    filter(!is.na(PlateLocSide), !is.na(PlateLocHeight)) %>%
+    mutate(PX = if (isTRUE(CATCHER_VIEW)) -PlateLocSide else PlateLocSide)
+  pitch_counts <- zone_df %>% count(PlotPitchType, name = "n_pitches")
+
+  heatmap_types <- pitch_counts %>% filter(n_pitches >= 100) %>% pull(PlotPitchType)
+  point_types   <- pitch_counts %>% filter(n_pitches <  100) %>% pull(PlotPitchType)
+
+  zone_plot <- ggplot() +
+    geom_rect(data = data.frame(xmin = SZ_XMIN, xmax = SZ_XMAX,
+                                ymin = SZ_YMIN, ymax = SZ_YMAX),
+              aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+              inherit.aes = FALSE, fill = NA, color = "black", linewidth = 1.2) +
+    geom_segment(data = home_plate_segments,
+                 aes(x = x, y = y, xend = xend, yend = yend),
+                 color = "black", linewidth = 1, inherit.aes = FALSE) +
+    stat_density_2d(
+      data = zone_df %>% filter(PlotPitchType %in% heatmap_types),
+      aes(x = PX, y = PlateLocHeight, fill = after_stat(level)),
+      geom = "polygon", alpha = 0.45, contour = TRUE, show.legend = FALSE) +
+    scale_fill_gradient(low = "#ffe5e5", high = "#cc0000") +
+    geom_point(
+      data = zone_df %>% filter(PlotPitchType %in% point_types),
+      aes(x = PX, y = PlateLocHeight, color = PlotPitchType),
+      alpha = 0.85, size = 2.4) +
+    facet_wrap(~PlotPitchType, ncol = if (n_pt <= 4) n_pt else 3) +
+    scale_color_manual(values = pitch_colors, guide = "none") +
+    scale_y_continuous(limits = c(0, 5.5)) +
+    scale_x_continuous(limits = c(-2.5, 2.5)) +
+    labs(title = "Strike Zone Plot by Pitch Type",
+         subtitle = if (isTRUE(CATCHER_VIEW)) "Catcher's view" else "Pitcher's view",
+         x = NULL, y = NULL) +
+    coord_fixed() +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 14),
+          plot.subtitle = element_text(size = 9, color = "gray40"),
+          legend.position = "none",
+          strip.text = element_text(face = "bold", size = if (n_pt >= 5) 9 else 11),
+          panel.grid.major = element_line(color = "gray90"),
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(fill = "white"),
+          panel.border = element_rect(color = "black", fill = NA, linewidth = 1))
+
+  cat('<div class="full-plot">\n\n')
+  print(zone_plot)
+  cat('\n\n</div>\n\n')
+
+  # ================== PITCH SUMMARY ==================
+  # STRIKE = IN THE RULEBOOK BOX. The PitchCall tag is deliberately ignored:
+  # nobody swings in a pen, so the only strikes possible are called ones, and a
+  # called strike in a pen is one person's judgment with no umpire behind it. On
+  # the 8/14 session the tag and the box disagreed on 2 of 45 pitches — both
+  # called strikes that crossed roughly 8 inches off the outside edge.
+  #
+  # That makes Strike% identical to Zone% by construction, so only ONE of them
+  # is printed. The denominator is pitches with a TRACKED location, so a pitch
+  # TrackMan missed is not scored a ball for having no location.
+  summary_table <- df_plot %>%
+    mutate(
+      HasLoc  = !is.na(PlateLocSide) & !is.na(PlateLocHeight),
+      InZone  = HasLoc & PlateLocSide >= SZ_XMIN & PlateLocSide <= SZ_XMAX &
+                        PlateLocHeight >= SZ_YMIN & PlateLocHeight <= SZ_YMAX
+    ) %>%
+    group_by(PlotPitchType) %>%
+    summarise(
+      `#`        = n(),
+      `Usage %`  = n(),                       # converted to a % below
+      `Avg Velo` = round(mean(RelSpeed, na.rm = TRUE), 1),
+      `Max Velo` = round(max(RelSpeed,  na.rm = TRUE), 1),
+      `Spin`     = round(mean(SpinRate, na.rm = TRUE), 0),
+      `Tilt`     = ifelse(all(is.na(SpinAxis)), "\u2014",
+                          tilt_from_axis(mean_axis(SpinAxis))),
+      `iVB`      = round(mean(InducedVertBreak, na.rm = TRUE), 1),
+      `HB`       = round(mean(HorzBreak, na.rm = TRUE), 1),
+      `RelH`     = round(mean(RelHeight, na.rm = TRUE), 1),
+      `RelS`     = round(mean(RelSide,   na.rm = TRUE), 1),
+      `Ext`      = round(mean(Extension, na.rm = TRUE), 1),
+      `VAA`      = paste0(round(mean(VertApprAngle, na.rm = TRUE), 1), "\u00B0"),
+      `Strike %` = ifelse(sum(HasLoc) == 0, "\u2014",
+                          paste0(round(sum(InZone) / sum(HasLoc) * 100, 1), "%")),
+      .groups = "drop"
+    ) %>%
+    mutate(`Usage %` = paste0(round(100 * `Usage %` / sum(`Usage %`), 1), "%")) %>%
+    arrange(desc(`Avg Velo`)) %>%
+    rename(`Pitch Type` = PlotPitchType)
+
+  cat('\n\n')
+  cat('## Pitch Summary\n\n')
+
+  summary_table %>%
+    kable(format = "html", align = "c", escape = FALSE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = TRUE, font_size = 11) %>%
+    row_spec(0, bold = TRUE, background = "#f0f0f0") %>%
+    print()
+
+  cat('\n\n')
+
+  # ================== OVERALL METRICS ==================
+  # Bullpen version. Nobody swings in a pen, so no Whiff / Chase / Putaway /
+  # K% / BB% here — those columns would all be 0 or NaN.
+  n_all     <- nrow(pdat)
+  n_tracked <- sum(!is.na(pdat$RelSpeed))
+  has_loc   <- !is.na(df_plot$PlateLocSide) & !is.na(df_plot$PlateLocHeight)
+  in_zone   <- has_loc &
+               df_plot$PlateLocSide   >= SZ_XMIN & df_plot$PlateLocSide   <= SZ_XMAX &
+               df_plot$PlateLocHeight >= SZ_YMIN & df_plot$PlateLocHeight <= SZ_YMAX
+
+  overall_metrics <- tibble(
+    `P`        = n_all,
+    `Tracked`  = paste0(n_tracked, "/", n_all),
+    `Types`    = n_pt,
+    `Strike %` = ifelse(sum(has_loc) == 0, "\u2014",
+                        paste0(round(sum(in_zone) / sum(has_loc) * 100, 1), "%")),
+    `Top Velo` = round(max(df_plot$RelSpeed, na.rm = TRUE), 1),
+    `Avg Spin` = round(mean(df_plot$SpinRate, na.rm = TRUE), 0),
+    `Avg Ext`  = paste0(round(mean(df_plot$Extension, na.rm = TRUE), 1), "ft"),
+    `Avg RelH` = paste0(round(mean(df_plot$RelHeight, na.rm = TRUE), 1), "ft"),
+    `Avg RelS` = paste0(round(mean(df_plot$RelSide,   na.rm = TRUE), 1), "ft")
+  )
+
+  cat('## Overall Metrics\n\n')
+
+  overall_metrics %>%
+    kable(format = "html", align = "c") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = TRUE, font_size = 11) %>%
+    row_spec(0, bold = TRUE, background = "#f0f0f0") %>%
+    print()
+
+  cat('\n\n')
+  cat('</div>\n\n')
+
+  # ==================================================================
+  # PAGE 2 — PITCH-BY-PITCH LOG ("back of the sheet")
+  # ------------------------------------------------------------------
+  # Built from `pdat`, NOT df_plot, so an untracked pitch still appears in
+  # the sequence (metrics as em dashes) and the count matches the real pen.
+  # No Inn / Batter / Count columns — a bullpen has none of that. The
+  # batter column is replaced by PT#, the nth pitch of that type.
+  # ==================================================================
+  if (SHOW_PITCH_LOG && nrow(pdat) > 0) {
+
+    log_pitch_colors <- pitch_colors
+    log_pitch_colors[c("Cutter","Changeup","ChangeUp","Sweeper","Knuckleball")] <-
+      c("#B7950B","#1E8449","#1E8449","#0E7490","#4D7A2E")
+
+    fmt1 <- function(x) ifelse(is.na(.num(x)), "\u2014", sprintf("%.1f", .num(x)))
+    fmt0 <- function(x) ifelse(is.na(.num(x)), "\u2014", sprintf("%.0f", .num(x)))
+
+    log_raw <- pdat %>%
+      mutate(
+        .pc  = as.character(PitchCall),
+        .ppt = as.character(PlotPitchType),
+        .res = case_when(
+          .pc == "HitByPitch"                                    ~ "HBP",
+          .pc == "BallIntentional"                               ~ "IB",
+          .pc %in% c("BallCalled","BallinDirt")                  ~ "B",
+          .pc == "StrikeCalled"                                  ~ "CS",
+          .pc == "StrikeSwinging"                                ~ "SW",
+          grepl("^Foul", .pc)                                    ~ "F",
+          .pc == "InPlay"                                        ~ "IP",
+          TRUE                                                   ~ "\u2014"),
+        .res_col = case_when(
+          .res %in% c("B","IB","HBP") ~ "#C0392B",
+          .res %in% c("CS","SW")      ~ "#1E8449",
+          .res == "F"                 ~ "#B9770E",
+          TRUE                        ~ "#21618C"),
+        .res_bold = .res %in% c("CS","SW")
+      )
+
+    log_disp <- log_raw %>%
+      transmute(
+        `#`    = SeqNo,
+        `PT#`  = if (PT_NUM_SHOW_TOTAL) paste0(PTNum, "/", PTTot) else as.character(PTNum),
+        Pitch  = cell_spec(
+                   ifelse(!is.na(.ppt) & .ppt %in% names(pitch_abbr),
+                          unname(pitch_abbr[.ppt]),
+                          ifelse(is.na(.ppt), "\u2014", substr(.ppt, 1, 2))),
+                   "html", bold = TRUE,
+                   color = ifelse(!is.na(.ppt) & .ppt %in% names(log_pitch_colors),
+                                  unname(log_pitch_colors[.ppt]), "#333333")),
+        Res    = cell_spec(.res, "html", bold = .res_bold, color = .res_col),
+        Velo   = fmt1(RelSpeed),
+        Spin   = fmt0(SpinRate),
+        Tilt   = ifelse(is.na(Tilt) | Tilt == "", "\u2014", as.character(Tilt)),
+        iVB    = fmt1(InducedVertBreak),
+        HB     = fmt1(HorzBreak),
+        Ext    = fmt1(Extension),
+        RelH   = fmt1(RelHeight),
+        RelS   = fmt1(RelSide),
+        VAA    = fmt1(VertApprAngle),
+        HAA    = fmt1(HorzApprAngle),
+        pX     = fmt1(PlateLocSide),
+        pZ     = fmt1(PlateLocHeight),
+        .ppt   = .ppt
+      )
+
+    # Shade alternating RUNS of the same pitch type (the pen's "sets"), with
+    # a thin rule wherever he changes pitch. This is the bullpen analog of
+    # the in-season log's alternating innings and per-PA rules.
+    render_log_tbl <- function(d, cols) {
+      pv    <- ifelse(is.na(d$.ppt), "\u2014", d$.ppt)
+      grp   <- cumsum(c(TRUE, pv[-1] != pv[-length(pv)]))
+      shade <- which(grp %% 2 == 0)
+      brdr  <- which(c(diff(grp) != 0, FALSE))     # last row of each run
+      both  <- intersect(shade, brdr)
+      s_o   <- setdiff(shade, brdr)
+      b_o   <- setdiff(brdr, shade)
+      bcss  <- "border-bottom: 1px solid #aab2ba;"
+
+      k <- d[, cols, drop = FALSE] %>%
+        kable(format = "html", align = "c", escape = FALSE) %>%
+        kable_styling(bootstrap_options = c("condensed"), full_width = TRUE) %>%
+        row_spec(0, bold = TRUE, background = "#e6e9ec")
+      if (length(s_o))  k <- row_spec(k, s_o,  background = "#eef2f6")
+      if (length(b_o))  k <- row_spec(k, b_o,  extra_css = bcss)
+      if (length(both)) k <- row_spec(k, both, background = "#eef2f6", extra_css = bcss)
+      k
+    }
+
+    n_log     <- nrow(log_disp)
+    split_log <- n_log > LOG_SPLIT_MIN
+    cols_use  <- if (split_log) LOG_COLS_COMPACT else LOG_COLS_FULL
+    rows_side <- if (split_log) ceiling(n_log / 2) else n_log
+
+    # Font is capped by how much COLUMN WIDTH is available, not by height:
+    # the full-width table can carry a much bigger font than a half-width one.
+    lf <- if (!split_log) {
+            if (rows_side <= 30) 9.6 else if (rows_side <= 45) 8.8 else 7.8
+          } else if (rows_side <= 55) 7.2
+            else if (rows_side <= 70) 6.8
+            else 6.2
+
+    # ...so stretch ROW PADDING to fill the page height that's left over,
+    # rather than stopping two-thirds down. Capped so a 20-pitch pen doesn't
+    # get absurdly airy rows. rows_side + 1 accounts for the header row.
+    text_pt <- rows_side * lf * 1.12
+    lp <- round(min(3.8, max(0.4, (LOG_TARGET_PT - text_pt) / (rows_side + 1) / 2)), 2)
+
+    # Same rule as the front page: a strike is a pitch in the box, and the
+    # denominator is located pitches, not every pitch in the log (the log
+    # includes untracked pitches so the sequence stays complete).
+    .lz  <- !is.na(log_raw$PlateLocSide) & !is.na(log_raw$PlateLocHeight)
+    .liz <- .lz &
+            log_raw$PlateLocSide   >= SZ_XMIN & log_raw$PlateLocSide   <= SZ_XMAX &
+            log_raw$PlateLocHeight >= SZ_YMIN & log_raw$PlateLocHeight <= SZ_YMAX
+    n_loc     <- sum(.lz, na.rm = TRUE)
+    n_strikes <- sum(.liz, na.rm = TRUE)
+
+    cat(sprintf('<div class="pitch-log-section" style="--lf: %.1fpt; --lp: %.2fpt">\n\n',
+                lf, lp))
+    cat(paste0('<h1>', pitcher_name, ' &mdash; Pitch by Pitch</h1>\n'))
+    cat(paste0('<div class="log-sub">', session_date, ' &nbsp;|&nbsp; ',
+               params$session_label, ' &nbsp;|&nbsp; ', n_log, ' P &nbsp;|&nbsp; ',
+               n_pt, ' pitch types &nbsp;|&nbsp; ',
+               ifelse(n_loc == 0, "\u2014",
+                      paste0(round(100 * n_strikes / n_loc, 0), '%')),
+               ' strikes</div>\n'))
+
+    if (split_log) {
+      half <- ceiling(n_log / 2)
+      d1 <- log_disp[1:half, , drop = FALSE]
+      d2 <- log_disp[(half + 1):n_log, , drop = FALSE]
+      cat('<div class="log-split">\n<div>\n\n')
+      print(render_log_tbl(d1, cols_use))
+      cat('\n\n</div>\n<div>\n\n')
+      print(render_log_tbl(d2, cols_use))
+      cat('\n\n</div>\n</div>\n\n')
+    } else {
+      print(render_log_tbl(log_disp, cols_use))
+    }
+
+    cat(paste0('<div class="log-legend">',
+               'PT# = which pitch of that type it was in the session &middot; ',
+               'Res = the tag as charted: B = ball &middot; IB = intentional &middot; ',
+               'CS = called strike &middot; SW = swinging strike &middot; F = foul &middot; ',
+               'IP = in play &middot; shading marks a run of the same pitch type &middot; ',
+               'strike rates above and on the card are the RULEBOOK ZONE, not the tag',
+               '</div>\n'))
+    cat('</div>\n\n')
+  }
+}
+```
